@@ -1,52 +1,274 @@
-// Package fandom is the library behind the fandom command line:
-// the HTTP client, request shaping, and the typed data models for fandom.
+// Package fandom is the library behind the fandom command: the HTTP client,
+// request shaping, and the typed data models for Fandom wikis.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The Fandom v1 API is open and requires no authentication. All endpoints live
+// at https://{wiki}.fandom.com/api/v1/. The wiki slug is passed per-call so
+// a single client can serve any of Fandom's 350,000+ wikis.
 package fandom
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to fandom. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
+// DefaultUserAgent identifies the client to fandom.com.
 const DefaultUserAgent = "fandom/dev (+https://github.com/tamnd/fandom-cli)"
 
-// Client talks to fandom over HTTP.
-type Client struct {
-	HTTP      *http.Client
-	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+// ErrNotFound is returned when a requested article ID is not in the API response.
+var ErrNotFound = errors.New("not found")
 
-	last time.Time
+// Config holds constructor parameters for Client.
+type Config struct {
+	// BaseURL is used in tests to redirect all requests to a local server.
+	// In production leave it empty or set to "https://%s.fandom.com".
+	BaseURL   string
+	Wiki      string
+	UserAgent string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible production defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://%s.fandom.com",
+		Wiki:      "starwars",
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
+		Timeout:   15 * time.Second,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the Fandom v1 API.
+type Client struct {
+	httpClient *http.Client
+	cfg        Config
+	mu         sync.Mutex
+	last       time.Time
+}
+
+// NewClient returns a Client with the given config.
+func NewClient(cfg Config) *Client {
+	if cfg.UserAgent == "" {
+		cfg.UserAgent = DefaultUserAgent
+	}
+	return &Client{
+		httpClient: &http.Client{Timeout: cfg.Timeout},
+		cfg:        cfg,
+	}
+}
+
+// wikiBase returns the base URL for the given wiki slug.
+// In test mode (localhost/127.0.0.1) it returns cfg.BaseURL directly so all
+// requests are routed to the test server.
+func (c *Client) wikiBase(wiki string) string {
+	base := c.cfg.BaseURL
+	if strings.HasPrefix(base, "http://127.0.0.1") ||
+		strings.HasPrefix(base, "http://localhost") {
+		return base
+	}
+	return fmt.Sprintf("https://%s.fandom.com", wiki)
+}
+
+// effectiveWiki returns wiki if non-empty, else cfg.Wiki.
+func (c *Client) effectiveWiki(wiki string) string {
+	if wiki != "" {
+		return wiki
+	}
+	return c.cfg.Wiki
+}
+
+// ─── public methods ───────────────────────────────────────────────────────────
+
+// Search searches articles in a wiki using the Fandom v1 Search/List endpoint.
+func (c *Client) Search(ctx context.Context, wiki, query string, limit int) ([]Article, error) {
+	wiki = c.effectiveWiki(wiki)
+	if limit <= 0 {
+		limit = 20
+	}
+	params := url.Values{}
+	params.Set("query", query)
+	params.Set("limit", strconv.Itoa(limit))
+	params.Set("namespaces", "0")
+
+	rawURL := c.wikiBase(wiki) + "/api/v1/Search/List?" + params.Encode()
+	var resp wireSearchResp
+	if err := c.getJSON(ctx, rawURL, &resp); err != nil {
+		return nil, err
+	}
+	out := make([]Article, 0, len(resp.Items))
+	for _, it := range resp.Items {
+		out = append(out, Article{
+			ID:      it.ID,
+			Title:   it.Title,
+			URL:     it.URL,
+			Quality: it.Quality,
+			NS:      it.NS,
+		})
+	}
+	return out, nil
+}
+
+// Top returns popular articles from a wiki using the Fandom v1 Articles/Top endpoint.
+func (c *Client) Top(ctx context.Context, wiki string, limit int) ([]Article, error) {
+	wiki = c.effectiveWiki(wiki)
+	if limit <= 0 {
+		limit = 25
+	}
+	params := url.Values{}
+	params.Set("limit", strconv.Itoa(limit))
+	params.Set("namespaces", "0")
+
+	rawURL := c.wikiBase(wiki) + "/api/v1/Articles/Top?" + params.Encode()
+	var resp wireTopResp
+	if err := c.getJSON(ctx, rawURL, &resp); err != nil {
+		return nil, err
+	}
+	base := resp.BasePath
+	out := make([]Article, 0, len(resp.Items))
+	for _, it := range resp.Items {
+		out = append(out, Article{
+			ID:       it.ID,
+			Title:    it.Title,
+			URL:      fullURL(base, it.URL),
+			Abstract: it.Abstract,
+			Quality:  it.Quality,
+			NS:       it.NS,
+		})
+	}
+	return out, nil
+}
+
+// List returns a paginated list of articles using the Fandom v1 Articles/List endpoint.
+func (c *Client) List(ctx context.Context, wiki string, limit, offset int) ([]Article, error) {
+	wiki = c.effectiveWiki(wiki)
+	if limit <= 0 {
+		limit = 25
+	}
+	params := url.Values{}
+	params.Set("limit", strconv.Itoa(limit))
+	params.Set("offset", strconv.Itoa(offset))
+	params.Set("namespaces", "0")
+
+	rawURL := c.wikiBase(wiki) + "/api/v1/Articles/List?" + params.Encode()
+	var resp wireArticleListResp
+	if err := c.getJSON(ctx, rawURL, &resp); err != nil {
+		return nil, err
+	}
+	base := resp.BasePath
+	out := make([]Article, 0, len(resp.Items))
+	for _, it := range resp.Items {
+		out = append(out, Article{
+			ID:       it.ID,
+			Title:    it.Title,
+			URL:      fullURL(base, it.URL),
+			Abstract: it.Abstract,
+			Quality:  it.Quality,
+			NS:       it.NS,
+		})
+	}
+	return out, nil
+}
+
+// GetArticle fetches details for a single article by numeric ID.
+// Returns ErrNotFound if the ID is not in the response.
+func (c *Client) GetArticle(ctx context.Context, wiki string, id int) (Article, error) {
+	wiki = c.effectiveWiki(wiki)
+	params := url.Values{}
+	params.Set("ids", strconv.Itoa(id))
+	params.Set("abstract", "500")
+
+	rawURL := c.wikiBase(wiki) + "/api/v1/Articles/Details?" + params.Encode()
+	var resp wireDetailsResp
+	if err := c.getJSON(ctx, rawURL, &resp); err != nil {
+		return Article{}, err
+	}
+	key := strconv.Itoa(id)
+	it, ok := resp.Items[key]
+	if !ok {
+		return Article{}, fmt.Errorf("article %d: %w", id, ErrNotFound)
+	}
+	return Article{
+		ID:       it.ID,
+		Title:    it.Title,
+		URL:      fullURL(resp.BasePath, it.URL),
+		Abstract: it.Abstract,
+	}, nil
+}
+
+// Activity returns recent edit activity from a wiki.
+func (c *Client) Activity(ctx context.Context, wiki string, limit int) ([]ActivityItem, error) {
+	wiki = c.effectiveWiki(wiki)
+	if limit <= 0 {
+		limit = 20
+	}
+	params := url.Values{}
+	params.Set("limit", strconv.Itoa(limit))
+	params.Set("allowDuplicates", "false")
+
+	rawURL := c.wikiBase(wiki) + "/api/v1/Activity/LatestActivity?" + params.Encode()
+	var resp wireActivityResp
+	if err := c.getJSON(ctx, rawURL, &resp); err != nil {
+		return nil, err
+	}
+	out := make([]ActivityItem, 0, len(resp.Items))
+	for _, it := range resp.Items {
+		out = append(out, ActivityItem{
+			ArticleID:    it.ArticleID,
+			ArticleTitle: it.Article.Title,
+			RevisionID:   it.RevisionID,
+			Timestamp:    it.Timestamp,
+			User:         it.User.Name,
+			URL:          it.Article.URL,
+		})
+	}
+	return out, nil
+}
+
+// Info returns metadata for a wiki using the Mercury/WikiVariables endpoint.
+func (c *Client) Info(ctx context.Context, wiki string) (WikiInfo, error) {
+	wiki = c.effectiveWiki(wiki)
+	rawURL := c.wikiBase(wiki) + "/api/v1/Mercury/WikiVariables"
+	var resp wireWikiVarsResp
+	if err := c.getJSON(ctx, rawURL, &resp); err != nil {
+		return WikiInfo{}, err
+	}
+	return WikiInfo{
+		SiteName: resp.Data.SiteName,
+		BasePath: resp.Data.BasePath,
+		Lang:     resp.Data.Lang,
+		Topic:    resp.Data.Topic,
+		Wiki:     wiki,
+	}, nil
+}
+
+// ─── HTTP helpers ─────────────────────────────────────────────────────────────
+
+func (c *Client) getJSON(ctx context.Context, rawURL string, v any) error {
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(body, v); err != nil {
+		return fmt.Errorf("decode %s: %w", rawURL, err)
+	}
+	return nil
+}
+
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -54,7 +276,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -63,18 +285,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -86,20 +309,20 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, true, err
 	}
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -111,4 +334,14 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
+}
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+// fullURL joins basePath and a possibly-relative URL.
+func fullURL(base, u string) string {
+	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+		return u
+	}
+	return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(u, "/")
 }
