@@ -1,0 +1,10 @@
+title       = "fandom"
+baseURL     = "https://fandom-cli.tamnd.com/"
+description = "Browse Fandom wikis"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/fandom-cli"
