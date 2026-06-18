@@ -12,16 +12,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	fhttp "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
 )
 
-// DefaultUserAgent identifies the client to fandom.com.
-const DefaultUserAgent = "fandom/dev (+https://github.com/tamnd/fandom-cli)"
+// DefaultUserAgent mimics Chrome 146 so Cloudflare Bot Management does not
+// flag the TLS fingerprint as a bot. The actual JA3/JA4 fingerprint is set by
+// the bogdanfinn/tls-client Chrome_146 profile — this UA matches that version.
+const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 
 // ErrNotFound is returned when a requested article ID is not in the API response.
 var ErrNotFound = errors.New("not found")
@@ -33,9 +38,13 @@ type Config struct {
 	BaseURL   string
 	Wiki      string
 	UserAgent string
+	Cookie    string
 	Rate      time.Duration
 	Retries   int
 	Timeout   time.Duration
+	// UseBrowser routes all HTTP requests through Chrome CDP (fetch() eval)
+	// instead of the tls-client.  Set automatically on first 403 fallback.
+	UseBrowser bool
 }
 
 // DefaultConfig returns sensible production defaults.
@@ -52,19 +61,27 @@ func DefaultConfig() Config {
 
 // Client talks to the Fandom v1 API.
 type Client struct {
-	httpClient *http.Client
+	httpClient tls_client.HttpClient
 	cfg        Config
 	mu         sync.Mutex
 	last       time.Time
 }
 
 // NewClient returns a Client with the given config.
+// It uses a Chrome 131 TLS profile so Cloudflare Bot Management does not flag
+// the connection as a non-browser based on JA3/JA4 fingerprint.
 func NewClient(cfg Config) *Client {
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = DefaultUserAgent
 	}
+	tlsc, _ := tls_client.NewHttpClient(
+		tls_client.NewNoopLogger(),
+		tls_client.WithTimeoutSeconds(int(cfg.Timeout.Seconds())+5),
+		tls_client.WithClientProfile(profiles.Chrome_146),
+		tls_client.WithCookieJar(tls_client.NewCookieJar()),
+	)
 	return &Client{
-		httpClient: &http.Client{Timeout: cfg.Timeout},
+		httpClient: tlsc,
 		cfg:        cfg,
 	}
 }
@@ -267,6 +284,13 @@ func (c *Client) getJSON(ctx context.Context, rawURL string, v any) error {
 }
 
 func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
+	// Skip direct HTTP if we're routing through Chrome (CF-protected wikis).
+	// Chrome CDP keeps the same TLS session that obtained cf_clearance, so the
+	// request passes CF checks that a separate HTTP client cannot replicate.
+	if c.cfg.UseBrowser {
+		return getViaChrome(ctx, rawURL)
+	}
+
 	var lastErr error
 	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
@@ -280,6 +304,13 @@ func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 		if err == nil {
 			return body, nil
 		}
+		// On 403, try routing through Chrome CDP (same session as cf_clearance).
+		if strings.Contains(err.Error(), "403") {
+			if b, cerr := getViaChrome(ctx, rawURL); cerr == nil {
+				c.cfg.UseBrowser = true // switch permanently for this session
+				return b, nil
+			}
+		}
 		lastErr = err
 		if !retry {
 			return nil, err
@@ -290,12 +321,21 @@ func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 
 func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	req, err := fhttp.NewRequestWithContext(ctx, fhttp.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.cfg.UserAgent)
-	req.Header.Set("Accept", "application/json")
+	req.Header = fhttp.Header{
+		"User-Agent":         []string{c.cfg.UserAgent},
+		"Accept":             []string{"application/json, text/html, */*; q=0.9"},
+		"Accept-Language":    []string{"en-US,en;q=0.9"},
+		"Accept-Encoding":    []string{"gzip, deflate, br"},
+		fhttp.HeaderOrderKey: {"user-agent", "accept", "accept-language", "accept-encoding"},
+	}
+	if c.cfg.Cookie != "" {
+		req.Header.Set("Cookie", c.cfg.Cookie)
+		req.Header[fhttp.HeaderOrderKey] = append(req.Header[fhttp.HeaderOrderKey], "cookie")
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -303,10 +343,10 @@ func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+	if resp.StatusCode == 429 || resp.StatusCode >= 500 {
 		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
 	}
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != 200 {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
