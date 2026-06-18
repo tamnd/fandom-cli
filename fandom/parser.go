@@ -1,7 +1,6 @@
 package fandom
 
 import (
-	"encoding/json"
 	"html"
 	"regexp"
 	"strings"
@@ -149,9 +148,10 @@ func stripTemplates(s string) string {
 			i += 2
 			continue
 		}
-		if depth == 0 {
+		switch depth {
+		case 0:
 			result.WriteRune(runes[i])
-		} else if depth == 1 {
+		case 1:
 			templateBuf.WriteRune(runes[i])
 		}
 		i++
@@ -426,17 +426,6 @@ func countWords(text string) int {
 		}
 	}
 	return count
-}
-
-func infoboxToJSON(fields map[string]string) string {
-	if len(fields) == 0 {
-		return ""
-	}
-	b, err := json.Marshal(fields)
-	if err != nil {
-		return ""
-	}
-	return string(b)
 }
 
 func truncateText(s string, n int) string {

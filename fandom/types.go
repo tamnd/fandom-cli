@@ -213,19 +213,19 @@ type wireMWQueryResp struct {
 }
 
 type wireMWPage struct {
-	PageID    int64                    `json:"pageid"`
-	NS        int                      `json:"ns"`
-	Title     string                   `json:"title"`
-	Length    int                      `json:"length"`
-	Touched   string                   `json:"touched"`
-	LastRevID int64                    `json:"lastrevid"`
-	Missing   string                   `json:"missing"`
-	Redirect  *struct{}                `json:"redirect"`
-	Extract   string                   `json:"extract"`
-	Revisions []wireMWRevision         `json:"revisions"`
-	Categories []wireMWCategory        `json:"categories"`
-	PageProps map[string]any           `json:"pageprops"`
-	Thumbnail *wireMWThumbnail         `json:"thumbnail"`
+	PageID     int64            `json:"pageid"`
+	NS         int              `json:"ns"`
+	Title      string           `json:"title"`
+	Length     int              `json:"length"`
+	Touched    string           `json:"touched"`
+	LastRevID  int64            `json:"lastrevid"`
+	Missing    string           `json:"missing"`
+	Redirect   *struct{}        `json:"redirect"`
+	Extract    string           `json:"extract"`
+	Revisions  []wireMWRevision `json:"revisions"`
+	Categories []wireMWCategory `json:"categories"`
+	PageProps  map[string]any   `json:"pageprops"`
+	Thumbnail  *wireMWThumbnail `json:"thumbnail"`
 }
 
 type wireMWRevision struct {
@@ -280,20 +280,6 @@ type wireMWRecentChangesResp struct {
 			Comment   string `json:"comment"`
 		} `json:"recentchanges"`
 	} `json:"query"`
-}
-
-// ─── wiki discovery wire types ────────────────────────────────────────────────
-
-type wireF2FeedResp struct {
-	Wikis []wireF2Wiki `json:"wikis"`
-}
-
-type wireF2Wiki struct {
-	ID       int    `json:"id"`
-	Name     string `json:"name"`
-	Domain   string `json:"domain"`
-	Hub      string `json:"hub"`
-	Language string `json:"language"`
 }
 
 // ─── existing wire types ──────────────────────────────────────────────────────
