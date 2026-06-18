@@ -64,9 +64,21 @@ func Root() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "fandom",
 		Short: "Browse Fandom wikis",
-		Long: `fandom reads fan wikis hosted on fandom.com through the public Fandom v1 API.
+		Long: `fandom reads fan wikis hosted on fandom.com.
 No API key is required. Use --wiki to select any of the 350,000+ Fandom wikis
 by its subdomain slug (e.g. --wiki minecraft for minecraft.fandom.com).
+
+Two API planes are used depending on the command:
+
+  Fandom v1 API   — search, top, list, article, activity, info
+  MediaWiki API   — page, allpages, revisions, siteinfo, recent, wikis
+
+The "page" command fetches every field the MediaWiki API exposes: wikitext,
+rendered Markdown, infobox key-value pairs, category list, internal and external
+link graphs, images, templates, thumbnail, last editor, and revision ID.
+
+The "allpages" command streams all page stubs in namespace 0, which is the BFS
+seed for reconstructing an entire wiki without missing any page.
 
 fandom is an independent tool and is not affiliated with Fandom, Inc.`,
 		SilenceUsage:  true,
@@ -97,6 +109,12 @@ fandom is an independent tool and is not affiliated with Fandom, Inc.`,
 		app.articleCmd(),
 		app.activityCmd(),
 		app.infoCmd(),
+		app.pageCmd(),
+		app.allPagesCmd(),
+		app.revisionsCmd(),
+		app.siteInfoCmd(),
+		app.recentCmd(),
+		app.wikisCmd(),
 		newVersionCmd(),
 	)
 	return root
