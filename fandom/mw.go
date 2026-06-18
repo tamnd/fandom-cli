@@ -196,7 +196,14 @@ func parseMWPage(p wireMWPage, base string) FullArticle {
 		plainText = wikitextToMarkdown(wikitext)
 	}
 
-	abstract := strings.TrimSpace(p.Extract)
+	abstract := ""
+	if p.Extract != "" {
+		// The extracts API returns HTML; strip tags and unescape entities.
+		a := reHTMLTag.ReplaceAllString(p.Extract, "")
+		a = html.UnescapeString(a)
+		a = reMultiNewline.ReplaceAllString(a, "\n\n")
+		abstract = strings.TrimSpace(a)
+	}
 	if abstract == "" && plainText != "" {
 		abstract = truncateText(plainText, 500)
 	}
@@ -219,6 +226,11 @@ func parseMWPage(p wireMWPage, base string) FullArticle {
 	thumbnail := ""
 	if p.Thumbnail != nil {
 		thumbnail = p.Thumbnail.Source
+	} else if len(images) > 0 {
+		// Fallback: construct a Commons thumbnail URL from the first image name.
+		// Works for most File: links; the API returns a proper URL when piprop succeeds.
+		name := strings.ReplaceAll(images[0], " ", "_")
+		thumbnail = "https://commons.wikimedia.org/wiki/Special:FilePath/" + url.QueryEscape(name)
 	}
 
 	articleURL := base + "/wiki/" + strings.ReplaceAll(p.Title, " ", "_")

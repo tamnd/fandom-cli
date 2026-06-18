@@ -24,7 +24,9 @@ var (
 	reInfobox      = regexp.MustCompile(`(?s)\{\{[Ii]nfobox[^|}\n]*\n(.*?)\}\}`)
 	reInfoboxField = regexp.MustCompile(`(?m)^\|\s*(\w+)[ \t]*=[ \t]*(.+)$`)
 	reHTMLTag      = regexp.MustCompile(`<[^>]+>`)
-	reRefTag       = regexp.MustCompile(`(?s)<ref[^>]*>.*?</ref>|<ref[^/]*/>|<references\s*/>`)
+	// Self-closing (<ref name="x" />) must come BEFORE the open+close pattern;
+	// otherwise <ref[^>]*> matches the /> as an open tag and .*? eats the document.
+	reRefTag = regexp.MustCompile(`(?s)<references\s*/>|<ref[^>]*/\s*>|<ref[^>]*>.*?</ref>`)
 	reComment      = regexp.MustCompile(`(?s)<!--.*?-->`)
 	reBulletL2     = regexp.MustCompile(`(?m)^\*\*([^*\n])`)
 	reBulletL1     = regexp.MustCompile(`(?m)^\*([^*\n])`)

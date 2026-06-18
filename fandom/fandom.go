@@ -87,13 +87,22 @@ func NewClient(cfg Config) *Client {
 }
 
 // wikiBase returns the base URL for the given wiki slug.
-// In test mode (localhost/127.0.0.1) it returns cfg.BaseURL directly so all
-// requests are routed to the test server.
+// When BaseURL is set to a localhost test server, it is used as-is.
+// When BaseURL is set to a custom remote URL (doesn't contain "fandom.com"),
+// it is used directly, allowing the CLI to target any MediaWiki installation.
+// Otherwise the default Fandom URL scheme is used.
 func (c *Client) wikiBase(wiki string) string {
 	base := c.cfg.BaseURL
+	if base == "" {
+		return fmt.Sprintf("https://%s.fandom.com", wiki)
+	}
 	if strings.HasPrefix(base, "http://127.0.0.1") ||
 		strings.HasPrefix(base, "http://localhost") {
 		return base
+	}
+	// Custom remote base URL (e.g. https://en.wikipedia.org/w or a self-hosted wiki).
+	if !strings.Contains(base, "fandom.com") {
+		return strings.TrimRight(base, "/")
 	}
 	return fmt.Sprintf("https://%s.fandom.com", wiki)
 }

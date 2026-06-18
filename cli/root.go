@@ -103,6 +103,7 @@ fandom is an independent tool and is not affiliated with Fandom, Inc.`,
 	pf.StringVar(&app.cfg.UserAgent, "user-agent", app.cfg.UserAgent, "User-Agent sent with each request")
 	pf.StringVar(&app.cfg.Cookie, "cookie", "", "Cookie header value (e.g. cf_clearance=...) for Cloudflare-protected wikis")
 	pf.BoolVar(&app.cfg.UseBrowser, "browser", false, "route all requests through Chrome CDP at localhost:9222 (bypasses Cloudflare)")
+	pf.StringVar(&app.cfg.BaseURL, "base-url", "", "override wiki base URL (e.g. https://en.wikipedia.org/w for Wikipedia)")
 
 	root.AddCommand(
 		app.searchCmd(),
