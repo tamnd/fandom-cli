@@ -1,18 +1,27 @@
 package fandom
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"context"
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
 )
+
+// CDP port used by CloakServer and by Chrome launched with --remote-debugging-port.
+const cdpPort = "9222"
+
+// ─── cookie cache ─────────────────────────────────────────────────────────────
 
 // cookieCache is the on-disk format for persisted fandom cookies.
 type cookieCache struct {
@@ -68,94 +77,194 @@ func CookieHeader(cookies map[string]string) string {
 	return strings.Join(parts, "; ")
 }
 
-// GrabCookies uses Chrome with CDP to obtain fandom.com cookies (including
-// cf_clearance) for the given wiki slug.
-//
-// It requires Chrome to be running with remote debugging:
-//
-//	/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-//	  --remote-debugging-port=9222 \
-//	  --remote-allow-origins='*' \
-//	  --user-data-dir=$HOME/data/fandom/chrome-profile \
-//	  https://<wiki>.fandom.com/
-//
-// Cookies are cached in ~/.cache/fandom-cli/cookies-{wiki}.json (20h TTL).
-func GrabCookies(wiki string) (map[string]string, error) {
-	cookies, err := grabFromCDP(wiki)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"failed to grab cookies via Chrome CDP: %w\n\n"+
-				"Start Chrome with remote debugging first:\n\n"+
-				"  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\\n"+
-				"    --remote-debugging-port=9222 \\\n"+
-				"    --remote-allow-origins='*' \\\n"+
-				"    --user-data-dir=$HOME/data/fandom/chrome-profile \\\n"+
-				"    https://%s.fandom.com/\n\n"+
-				"Then retry: fandom --wiki %s cookies",
-			err, wiki, wiki)
-	}
-	saveCookieCache(wiki, cookies, "")
-	return cookies, nil
+// ─── CloakServer (CloakBrowser CDP server) ────────────────────────────────────
+
+// CloakServerHandle holds the Docker container ID so the caller can stop it.
+type CloakServerHandle struct {
+	containerID string
 }
 
-// grabFromCDP connects to Chrome at localhost:9222, opens the wiki page, and
-// polls until cf_clearance appears (Chrome solves the JS challenge automatically
-// when launched without --enable-automation).
-func grabFromCDP(wiki string) (map[string]string, error) {
-	wsURL, err := launcher.ResolveURL("localhost:9222")
+// Stop terminates the CloakServer Docker container.
+func (h *CloakServerHandle) Stop() {
+	if h == nil || h.containerID == "" {
+		return
+	}
+	_ = exec.Command("docker", "stop", h.containerID).Run()
+}
+
+// LaunchCloakServer starts a CloakBrowser CDP server in a detached Docker
+// container and waits until it is accepting connections on localhost:9222.
+//
+// CloakBrowser (github.com/CloakHQ/cloakbrowser) is a modified Chromium build
+// with 58 source-level C++ patches that defeat Cloudflare Turnstile, reCAPTCHA,
+// and 30+ other bot-detection systems without any runtime injection.  The
+// managed challenge that fandom.com uses auto-resolves in the first navigation.
+//
+// It requires Docker to be installed and running.  Returns an error if Docker is
+// not available or the container fails to start.
+func LaunchCloakServer() (*CloakServerHandle, error) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		return nil, fmt.Errorf("docker not found in PATH: %w", err)
+	}
+
+	// Pull image if not cached (silent, errors are non-fatal).
+	pullCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	pull := exec.CommandContext(pullCtx, "docker", "pull", "cloakhq/cloakbrowser")
+	pull.Stdout = os.Stderr // progress to stderr
+	pull.Stderr = os.Stderr
+	_ = pull.Run()
+
+	out, err := exec.Command(
+		"docker", "run", "-d", "--rm",
+		"-p", "127.0.0.1:"+cdpPort+":9222",
+		"--shm-size=2g",
+		"cloakhq/cloakbrowser",
+		"cloakserve",
+	).Output()
 	if err != nil {
-		return nil, fmt.Errorf("chrome not found at localhost:9222: %w", err)
+		return nil, fmt.Errorf("docker run cloakbrowser: %w", err)
+	}
+	id := strings.TrimSpace(string(out))
+
+	// Wait up to 30 s for the CDP server to accept connections.
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", "localhost:"+cdpPort, time.Second)
+		if err == nil {
+			_ = conn.Close()
+			return &CloakServerHandle{containerID: id}, nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	_ = exec.Command("docker", "stop", id).Run()
+	return nil, fmt.Errorf("cloakserve did not accept connections within 30s")
+}
+
+// IsCDPAvailable returns true when something is already listening on :9222.
+func IsCDPAvailable() bool {
+	conn, err := net.DialTimeout("tcp", "localhost:"+cdpPort, 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// IsCloakServer returns true when the CDP endpoint at :9222 reports a CloakBrowser
+// User-Agent in the /json/version response.
+func IsCloakServer() bool {
+	resp, err := http.Get("http://localhost:" + cdpPort + "/json/version")
+	if err != nil {
+		return false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	return strings.Contains(strings.ToLower(string(body)), "cloak") ||
+		strings.Contains(string(body), "CloakBrowser")
+}
+
+// ─── GrabCookies ──────────────────────────────────────────────────────────────
+
+// GrabCookies obtains fandom.com cookies (including cf_clearance) for wiki.
+//
+// It uses this priority order:
+//  1. CDP already running at localhost:9222 (CloakServer or Chrome with
+//     --remote-debugging-port=9222) — navigate there and wait for CF to pass.
+//  2. Docker is available — launch CloakServer automatically, wait for CF,
+//     then stop the container.
+//  3. Neither — print instructions and return an error.
+//
+// Cookies are cached in ~/.cache/fandom-cli/cookies-{wiki}.json (20h TTL).
+// CloakBrowser resolves CF Turnstile managed challenges automatically; a plain
+// Chrome debug session may take longer (or fail on high-risk IPs).
+func GrabCookies(wiki string) (map[string]string, error) {
+	if IsCDPAvailable() {
+		fmt.Fprintf(os.Stderr, "connecting to CDP at localhost:%s...\n", cdpPort)
+		cookies, err := grabFromCDP(wiki)
+		if err != nil {
+			return nil, err
+		}
+		return cookies, nil
+	}
+
+	// Try to start CloakServer via Docker.
+	if _, err := exec.LookPath("docker"); err == nil {
+		fmt.Fprintln(os.Stderr, "no CDP at :9222 — launching CloakBrowser via Docker...")
+		handle, err := LaunchCloakServer()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "docker launch failed: %v\n", err)
+		} else {
+			defer handle.Stop()
+			fmt.Fprintln(os.Stderr, "CloakServer ready")
+			cookies, err := grabFromCDP(wiki)
+			if err != nil {
+				return nil, err
+			}
+			return cookies, nil
+		}
+	}
+
+	// Give up with helpful instructions.
+	return nil, fmt.Errorf(
+		"no CDP endpoint available\n\n"+
+			"Option A — CloakBrowser (recommended, bypasses CF automatically):\n"+
+			"  docker run -p 127.0.0.1:9222:9222 --rm --shm-size=2g cloakhq/cloakbrowser cloakserve\n"+
+			"  # in another terminal:\n"+
+			"  fandom --wiki %s cookies\n\n"+
+			"Option B — Chrome with remote debugging:\n"+
+			"  open -a 'Google Chrome' --args \\\n"+
+			"    --remote-debugging-port=9222 \\\n"+
+			"    --remote-allow-origins='*' \\\n"+
+			"    --user-data-dir=$HOME/.cache/fandom-cli/chrome-profile \\\n"+
+			"    https://%s.fandom.com/\n"+
+			"  # wait for the page to load, then:\n"+
+			"  fandom --wiki %s cookies",
+		wiki, wiki, wiki,
+	)
+}
+
+// grabFromCDP connects to the CDP endpoint at :9222, navigates to the wiki,
+// and polls until cf_clearance appears in the browser's cookie jar.
+// CloakBrowser resolves the CF managed challenge automatically within ~5 s;
+// a standard Chrome debug session may take up to 30 s on a trusted IP.
+func grabFromCDP(wiki string) (map[string]string, error) {
+	wsURL, err := launcher.ResolveURL("localhost:" + cdpPort)
+	if err != nil {
+		return nil, fmt.Errorf("resolve CDP at localhost:%s: %w", cdpPort, err)
 	}
 
 	b := rod.New().ControlURL(wsURL)
 	if err := b.Connect(); err != nil {
-		return nil, fmt.Errorf("connect to Chrome: %w", err)
+		return nil, fmt.Errorf("connect to CDP: %w", err)
 	}
 
 	wikiURL := fmt.Sprintf("https://%s.fandom.com/", wiki)
+	fmt.Fprintf(os.Stderr, "navigating to %s...\n", wikiURL)
 
-	// Check existing tabs for an already-loaded fandom page.
-	pages, err := b.Pages()
+	page, err := b.Page(proto.TargetCreateTarget{URL: wikiURL})
 	if err != nil {
-		return nil, fmt.Errorf("list pages: %w", err)
+		return nil, fmt.Errorf("open page: %w", err)
 	}
 
-	var fandomPage *rod.Page
-	for _, pg := range pages {
-		info, err := pg.Info()
-		if err != nil {
-			continue
-		}
-		if strings.Contains(info.URL, "fandom.com") {
-			fandomPage = pg
-			break
-		}
+	// Poll until cf_clearance appears or timeout.
+	// CloakBrowser solves CF Turnstile in ~5s; plain Chrome may need longer.
+	timeout := 30 * time.Second
+	if !IsCloakServer() {
+		timeout = 90 * time.Second
 	}
+	fmt.Fprintf(os.Stderr, "waiting up to %s for Cloudflare challenge...\n", timeout.Round(time.Second))
 
-	// Open a new tab if no fandom tab is open.
-	if fandomPage == nil {
-		fmt.Printf("opening %s in Chrome...\n", wikiURL)
-		fandomPage, err = b.Page(proto.TargetCreateTarget{URL: wikiURL})
-		if err != nil {
-			return nil, fmt.Errorf("open page: %w", err)
-		}
-	}
-
-	// Poll up to 45 seconds for cf_clearance to appear.
-	// Chrome solves the JS challenge on its own without user interaction when
-	// the browser was launched without the --enable-automation flag.
-	fmt.Printf("waiting for Cloudflare challenge on %s.fandom.com...\n", wiki)
-	deadline := time.Now().Add(45 * time.Second)
+	deadline := time.Now().Add(timeout)
 	var ua string
 	for time.Now().Before(deadline) {
 		rawCookies, err := b.GetCookies()
 		if err == nil {
 			m := fandomCookies(rawCookies)
 			if _, ok := m["cf_clearance"]; ok {
-				// Capture the User-Agent from any open page so HTTP clients can
-				// use the same UA that the cf_clearance was issued for.
-				if pages, err := b.Pages(); err == nil {
-					for _, pg := range pages {
+				// Capture the UA so the tls-client can send the same one.
+				if pgs, err := b.Pages(); err == nil {
+					for _, pg := range pgs {
 						if res, err := pg.Eval(`() => navigator.userAgent`); err == nil {
 							ua = res.Value.String()
 							break
@@ -163,54 +272,66 @@ func grabFromCDP(wiki string) (map[string]string, error) {
 					}
 				}
 				saveCookieCache(wiki, m, ua)
-				fmt.Printf("cf_clearance obtained (%d fandom.com cookies)\n", len(m))
+				fmt.Fprintf(os.Stderr, "cf_clearance obtained (%d cookies)\n", len(m))
 				return m, nil
 			}
 		}
 		time.Sleep(2 * time.Second)
-		// Re-navigate if still on the challenge screen.
-		if info, err := fandomPage.Info(); err == nil {
+
+		// If still on the challenge screen, try reloading.
+		if info, err := page.Info(); err == nil {
 			if strings.Contains(info.Title, "moment") || strings.Contains(info.Title, "Cloudflare") {
-				if !strings.Contains(info.URL, "fandom.com") {
-					_ = fandomPage.Navigate(wikiURL)
+				// Only reload if URL is still on the target domain (not a redirect).
+				if strings.Contains(info.URL, wiki+".fandom.com") {
+					_ = page.Navigate(wikiURL)
 				}
 			}
 		}
 	}
 
-	// Grab whatever cookies we have even without cf_clearance.
+	// Return whatever we have even without cf_clearance.
 	rawCookies, _ := b.GetCookies()
 	m := fandomCookies(rawCookies)
 	if len(m) > 0 {
-		fmt.Printf("got %d fandom.com cookies (no cf_clearance — challenge may not have passed)\n", len(m))
+		fmt.Fprintf(os.Stderr, "got %d cookies (no cf_clearance — challenge may not have passed)\n", len(m))
 		saveCookieCache(wiki, m, "")
 		return m, nil
 	}
-	return nil, fmt.Errorf("no fandom.com cookies found after 45s")
+	return nil, fmt.Errorf("no fandom.com cookies after %s — challenge did not pass", timeout.Round(time.Second))
 }
 
-// getViaChrome makes an HTTP GET request by evaluating fetch() in a Chrome tab
-// connected via CDP at localhost:9222.  The request runs inside Chrome's own
-// TLS session so cf_clearance is automatically sent and the fingerprint matches.
+// ─── getViaChrome ─────────────────────────────────────────────────────────────
+
+// getViaChrome makes an HTTP GET by evaluating fetch() inside the CDP browser
+// at :9222.  The request runs inside the browser's own TLS session so
+// cf_clearance is attached automatically and the fingerprint matches.
 //
-// If the open fandom tab is still on the CF challenge page, this waits up to
-// 90 seconds for Chrome to solve it before making the API fetch.
+// With CloakBrowser the CF challenge clears within seconds of navigation; with
+// a plain Chrome debug session this waits up to 90 s.
 func getViaChrome(ctx context.Context, rawURL string) ([]byte, error) {
-	wsURL, err := launcher.ResolveURL("localhost:9222")
+	if !IsCDPAvailable() {
+		return nil, fmt.Errorf(
+			"CDP not available at localhost:%s\n"+
+				"Run:  docker run -p 127.0.0.1:9222:9222 --rm --shm-size=2g cloakhq/cloakbrowser cloakserve",
+			cdpPort,
+		)
+	}
+
+	wsURL, err := launcher.ResolveURL("localhost:" + cdpPort)
 	if err != nil {
-		return nil, fmt.Errorf("chrome not at :9222 (start Chrome with --remote-debugging-port=9222): %w", err)
+		return nil, fmt.Errorf("resolve CDP: %w", err)
 	}
 	b := rod.New().ControlURL(wsURL)
 	if err := b.Connect(); err != nil {
-		return nil, fmt.Errorf("chrome connect: %w", err)
+		return nil, fmt.Errorf("CDP connect: %w", err)
 	}
 
 	pages, err := b.Pages()
 	if err != nil || len(pages) == 0 {
-		return nil, fmt.Errorf("no pages open in chrome")
+		return nil, fmt.Errorf("no pages open in CDP browser")
 	}
 
-	// Pick a fandom.com page if available; otherwise use whatever is open.
+	// Prefer a fandom.com page; fall back to whatever is open.
 	var page *rod.Page
 	for _, pg := range pages {
 		info, _ := pg.Info()
@@ -223,10 +344,14 @@ func getViaChrome(ctx context.Context, rawURL string) ([]byte, error) {
 		page = pages[0]
 	}
 
-	// Wait up to 90 s for the CF challenge to pass on the fandom tab.
-	// When Chrome is pointed at a fandom.com page, the managed challenge should
-	// resolve without user interaction once Chrome has a trusted session.
-	deadline := time.Now().Add(90 * time.Second)
+	// Wait for the CF challenge to clear.
+	// CloakBrowser resolves it automatically; plain Chrome may take longer.
+	cfTimeout := 90 * time.Second
+	if IsCloakServer() {
+		cfTimeout = 15 * time.Second
+	}
+
+	deadline := time.Now().Add(cfTimeout)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -237,36 +362,34 @@ func getViaChrome(ctx context.Context, rawURL string) ([]byte, error) {
 		if err != nil {
 			break
 		}
-		onChallenge := strings.Contains(info.Title, "moment") ||
-			strings.Contains(info.Title, "Cloudflare") ||
-			strings.Contains(info.URL, "challenges.cloudflare.com")
-		if !onChallenge {
+		if !strings.Contains(info.Title, "moment") && !strings.Contains(info.Title, "Cloudflare") {
 			break
 		}
-		time.Sleep(3 * time.Second)
+		time.Sleep(2 * time.Second)
 	}
 
-	// Check one more time that we are not on the challenge page.
-	if info, err := page.Info(); err == nil {
-		if strings.Contains(info.Title, "moment") {
-			return nil, fmt.Errorf("chrome: Cloudflare challenge still active after 90s — try visiting %s in Chrome manually", info.URL)
-		}
+	// Confirm we are past the challenge.
+	if info, err := page.Info(); err == nil && strings.Contains(info.Title, "moment") {
+		return nil, fmt.Errorf(
+			"cloudflare challenge not cleared after %s\n"+
+				"with CloakBrowser this should be automatic — try: fandom --wiki <slug> cookies --docker",
+			cfTimeout.Round(time.Second),
+		)
 	}
 
-	js := fmt.Sprintf(
-		`fetch(%q, {credentials: 'include'}).then(r => r.text())`,
-		rawURL,
-	)
+	js := fmt.Sprintf(`fetch(%q, {credentials: 'include'}).then(r => r.text())`, rawURL)
 	res, err := page.Eval(js)
 	if err != nil {
-		return nil, fmt.Errorf("chrome eval fetch(%q): %w", rawURL, err)
+		return nil, fmt.Errorf("CDP fetch(%q): %w", rawURL, err)
 	}
 	body := res.Value.String()
 	if strings.Contains(body, "Just a moment") || strings.Contains(body, "cf-challenge") {
-		return nil, fmt.Errorf("chrome: fetch returned CF challenge page")
+		return nil, fmt.Errorf("CDP fetch returned CF challenge page")
 	}
 	return []byte(body), nil
 }
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
 
 // fandomCookies filters a raw cookie list to only fandom.com cookies.
 func fandomCookies(cookies []*proto.NetworkCookie) map[string]string {
