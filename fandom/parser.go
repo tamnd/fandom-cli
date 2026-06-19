@@ -21,7 +21,6 @@ var (
 	reFileLink     = regexp.MustCompile(`(?i)\[\[(?:File|Image):([^\]|]+)(?:\|[^\]]*)?\]\]`)
 	reCategoryLink = regexp.MustCompile(`(?i)\[\[Category:([^\]|]+)(?:\|[^\]]*)?\]\]`)
 	reTemplate     = regexp.MustCompile(`\{\{([^}|\n{]+)`)
-	reInfobox      = regexp.MustCompile(`(?s)\{\{[Ii]nfobox[^|}\n]*\n(.*?)\}\}`)
 	reInfoboxField = regexp.MustCompile(`(?m)^\|\s*(\w+)[ \t]*=[ \t]*(.+)$`)
 	reHTMLTag      = regexp.MustCompile(`<[^>]+>`)
 	// Self-closing (<ref name="x" />) must come BEFORE the open+close pattern;
@@ -194,8 +193,7 @@ func convertTables(s string) string {
 			}
 			continue
 		}
-		if strings.HasPrefix(trimmed, "!") {
-			raw := strings.TrimPrefix(trimmed, "!")
+		if raw, ok := strings.CutPrefix(trimmed, "!"); ok {
 			cells := strings.Split(raw, "!!")
 			for i := range cells {
 				cells[i] = "**" + strings.TrimSpace(stripCellAttrs(cells[i])) + "**"
@@ -224,30 +222,69 @@ func convertTables(s string) string {
 }
 
 func stripCellAttrs(cell string) string {
-	if idx := strings.Index(cell, " | "); idx >= 0 {
-		return cell[idx+3:]
+	if _, after, ok := strings.Cut(cell, " | "); ok {
+		return after
 	}
 	return cell
 }
 
 // extractInfobox extracts key-value pairs from an infobox template.
+// It uses depth-tracking to find the FULL infobox body regardless of how many
+// nested templates are inside (the old regex approach stopped at the first }}
+// belonging to a nested template like {{plainlist|...}}).
 func extractInfobox(wikitext string) map[string]string {
-	result := extractInfoboxFromMatch(reInfobox.FindStringSubmatch(wikitext))
-	if len(result) > 0 {
-		return result
+	body := extractInfobobBody(wikitext)
+	if body != "" {
+		return parseInfoboxFields(body)
 	}
-	body := extractFirstTemplateBody(wikitext)
+	// Fallback: first top-level template that looks like an infobox (has | fields with =).
+	body = extractFirstTemplateBody(wikitext)
 	if body == "" {
 		return nil
 	}
 	return parseInfoboxFields(body)
 }
 
-func extractInfoboxFromMatch(m []string) map[string]string {
-	if m == nil {
-		return nil
+// extractInfobobBody uses rune-level depth-tracking to extract the full body of
+// the first {{Infobox …}} template in wikitext, regardless of nested templates.
+func extractInfobobBody(wikitext string) string {
+	runes := []rune(wikitext)
+	n := len(runes)
+	depth := 0
+	start := -1
+
+	for i := 0; i < n; i++ {
+		if i+1 < n && runes[i] == '{' && runes[i+1] == '{' {
+			depth++
+			if depth == 1 {
+				// Scan ahead to read the template name (up to first |, }, or newline).
+				j := i + 2
+				for j < n && runes[j] != '|' && runes[j] != '}' && runes[j] != '\n' {
+					j++
+				}
+				name := strings.ToLower(strings.TrimSpace(string(runes[i+2 : j])))
+				if strings.HasPrefix(name, "infobox") {
+					start = i + 2
+				}
+			}
+			i++
+			continue
+		}
+		if i+1 < n && runes[i] == '}' && runes[i+1] == '}' {
+			if depth == 1 {
+				if start >= 0 {
+					return string(runes[start:i])
+				}
+				start = -1
+			}
+			if depth > 0 {
+				depth--
+			}
+			i++
+			continue
+		}
 	}
-	return parseInfoboxFields(m[1])
+	return ""
 }
 
 func parseInfoboxFields(body string) map[string]string {
@@ -411,6 +448,17 @@ func extractTemplates(wikitext string) []string {
 		}
 	}
 	return templates
+}
+
+// hasImageExt reports whether name has a common image file extension.
+func hasImageExt(name string) bool {
+	lower := strings.ToLower(name)
+	for _, ext := range []string{".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".tif", ".tiff"} {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	return false
 }
 
 func countWords(text string) int {
