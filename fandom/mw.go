@@ -29,14 +29,14 @@ func (c *Client) AllPages(ctx context.Context, wiki, continueToken string, limit
 		return nil, "", err
 	}
 
-	base := c.wikiBase(wiki)
+	artBase := pageBase(c.wikiBase(wiki))
 	stubs := make([]PageStub, 0, len(resp.Query.AllPages))
 	for _, p := range resp.Query.AllPages {
 		stubs = append(stubs, PageStub{
 			ID:    p.PageID,
 			NS:    p.NS,
 			Title: p.Title,
-			URL:   base + "/wiki/" + strings.ReplaceAll(p.Title, " ", "_"),
+			URL:   artBase + "/wiki/" + strings.ReplaceAll(p.Title, " ", "_"),
 		})
 	}
 	return stubs, resp.Continue.APContinue, nil
@@ -159,6 +159,17 @@ func (c *Client) RecentChanges(ctx context.Context, wiki string, limit int) ([]R
 	return changes, nil
 }
 
+// pageBase returns the scheme+host root from any MediaWiki API base URL.
+// For Wikipedia (API at https://en.wikipedia.org/w), this returns
+// https://en.wikipedia.org so article URLs come out as /wiki/Title not /w/wiki/Title.
+func pageBase(apiBase string) string {
+	u, err := url.Parse(apiBase)
+	if err != nil {
+		return apiBase
+	}
+	return u.Scheme + "://" + u.Host
+}
+
 // parseMWPage converts a wireMWPage into a FullArticle.
 func parseMWPage(p wireMWPage, base string) FullArticle {
 	var wikitext string
@@ -173,11 +184,25 @@ func parseMWPage(p wireMWPage, base string) FullArticle {
 	}
 
 	images := extractImages(wikitext)
+	infoboxData := extractInfobox(wikitext)
+
+	// Supplement the [[File:]] image list with image filenames from infobox fields.
+	// Many articles store the lead image as | image = Foo.jpg rather than [[File:Foo.jpg]].
+	imgSet := make(map[string]bool, len(images))
+	for _, img := range images {
+		imgSet[strings.ToLower(img)] = true
+	}
+	for _, key := range []string{"image", "image1", "image2", "image3", "logo", "photo", "picture", "portrait", "cover", "map"} {
+		if v, ok := infoboxData[key]; ok && hasImageExt(v) && !imgSet[strings.ToLower(v)] {
+			images = append(images, v)
+			imgSet[strings.ToLower(v)] = true
+		}
+	}
+
 	cats := extractCategories(wikitext)
 	internalLinks := extractInternalLinks(wikitext)
 	externalLinks := extractExternalLinks(wikitext)
 	templates := extractTemplates(wikitext)
-	infobox := extractInfobox(wikitext)
 
 	catSet := make(map[string]bool)
 	for _, c := range cats {
@@ -196,7 +221,14 @@ func parseMWPage(p wireMWPage, base string) FullArticle {
 		plainText = wikitextToMarkdown(wikitext)
 	}
 
-	abstract := strings.TrimSpace(p.Extract)
+	abstract := ""
+	if p.Extract != "" {
+		// The extracts API returns HTML; strip tags and unescape entities.
+		a := reHTMLTag.ReplaceAllString(p.Extract, "")
+		a = html.UnescapeString(a)
+		a = reMultiNewline.ReplaceAllString(a, "\n\n")
+		abstract = strings.TrimSpace(a)
+	}
 	if abstract == "" && plainText != "" {
 		abstract = truncateText(plainText, 500)
 	}
@@ -219,9 +251,18 @@ func parseMWPage(p wireMWPage, base string) FullArticle {
 	thumbnail := ""
 	if p.Thumbnail != nil {
 		thumbnail = p.Thumbnail.Source
+	} else {
+		// Fallback priority: infobox image > first [[File:]] link.
+		// The infobox image is usually the main article image;
+		// [[File:]] links often include icons and license badges.
+		if v, ok := infoboxData["image"]; ok && hasImageExt(v) {
+			thumbnail = "https://commons.wikimedia.org/wiki/Special:FilePath/" + url.QueryEscape(strings.ReplaceAll(v, " ", "_"))
+		} else if len(images) > 0 {
+			thumbnail = "https://commons.wikimedia.org/wiki/Special:FilePath/" + url.QueryEscape(strings.ReplaceAll(images[0], " ", "_"))
+		}
 	}
 
-	articleURL := base + "/wiki/" + strings.ReplaceAll(p.Title, " ", "_")
+	articleURL := pageBase(base) + "/wiki/" + strings.ReplaceAll(p.Title, " ", "_")
 
 	return FullArticle{
 		ID:            p.PageID,
@@ -237,7 +278,7 @@ func parseMWPage(p wireMWPage, base string) FullArticle {
 		InternalLinks: internalLinks,
 		ExternalLinks: externalLinks,
 		Templates:     templates,
-		InfoboxFields: infobox,
+		InfoboxFields: infoboxData,
 		Thumbnail:     thumbnail,
 		LastEditor:    lastEditor,
 		RevisionID:    revID,

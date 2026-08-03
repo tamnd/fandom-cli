@@ -101,6 +101,9 @@ fandom is an independent tool and is not affiliated with Fandom, Inc.`,
 	pf.DurationVar(&app.cfg.Timeout, "timeout", app.cfg.Timeout, "per-request timeout")
 	pf.IntVar(&app.cfg.Retries, "retries", app.cfg.Retries, "retry attempts on 429/5xx")
 	pf.StringVar(&app.cfg.UserAgent, "user-agent", app.cfg.UserAgent, "User-Agent sent with each request")
+	pf.StringVar(&app.cfg.Cookie, "cookie", "", "Cookie header value (e.g. cf_clearance=...) for Cloudflare-protected wikis")
+	pf.BoolVar(&app.cfg.UseBrowser, "browser", false, "route all requests through Chrome CDP at localhost:9222 (bypasses Cloudflare)")
+	pf.StringVar(&app.cfg.BaseURL, "base-url", "", "override wiki base URL (e.g. https://en.wikipedia.org/w for Wikipedia)")
 
 	root.AddCommand(
 		app.searchCmd(),
@@ -115,6 +118,7 @@ fandom is an independent tool and is not affiliated with Fandom, Inc.`,
 		app.siteInfoCmd(),
 		app.recentCmd(),
 		app.wikisCmd(),
+		app.cookiesCmd(),
 		newVersionCmd(),
 	)
 	return root
@@ -132,6 +136,15 @@ func (a *App) setup() error {
 		return codeError(exitUsage, fmt.Errorf("unknown output format %q", a.output))
 	}
 	a.cfg.Wiki = a.wiki
+	// Auto-load cached cookies and UA from a prior `fandom cookies` run.
+	if a.cfg.Cookie == "" {
+		if cached, ua := fandom.LoadCookieCache(a.wiki); len(cached) > 0 {
+			a.cfg.Cookie = fandom.CookieHeader(cached)
+			if ua != "" && a.cfg.UserAgent == fandom.DefaultUserAgent {
+				a.cfg.UserAgent = ua
+			}
+		}
+	}
 	a.client = fandom.NewClient(a.cfg)
 	return nil
 }
